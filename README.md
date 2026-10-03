@@ -129,7 +129,21 @@ Logs: `polydisplay.log` in the working directory. Rolled at local midnight to
 
 ## Data
 
-Candles and prices: Kraken, with Coinbase fallback. Kraken ticker prices are
+Candles and prices: choose Auto, Kraken, Binance, or Coinbase in Settings.
+Auto uses Kraken with Coinbase fallback; explicit selections use only that
+exchange. Kraken and Coinbase use USD; Binance uses USDT pairs and may be
+unavailable in some regions or for some assets. All sources use the same candle
+intervals: 15 minutes (1 day), 1 hour (7 days), and 4 hours (14/30 days). Coinbase
+hourly candles are paginated and combined into complete UTC-aligned 4-hour buckets.
+
+The trend badge follows the selected period, as do the swing/channel overlays.
+Both analyze closed candles only; the current candle and live spot remain visible.
+Incomplete, gapped, invalid, or stale history shows an unavailable verdict and
+suppresses channel overlays. Trend direction compares high/low extremes across
+thirds of the period with a deadband of 3.5 median candle ranges; channel lines
+fit the confirmed swing highs and lows.
+
+Kraken ticker prices are
 fetched in one request; OHLC requests are paced to its public API guidance.
 Positions and activity: Polymarket data-api, independently polled every 30s
 and 1 min without request bursts. Account P/L: Polymarket user-pnl-api, 720
