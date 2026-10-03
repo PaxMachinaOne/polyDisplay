@@ -180,6 +180,13 @@
       <option value="1">1 day</option><option value="7">7 days</option>
       <option value="14">14 days</option><option value="30">30 days</option>
     </select>
+    <label>Market data source</label>
+    <select id="providerSel">
+      <option value="auto">Auto (Kraken → Coinbase)</option>
+      <option value="kraken">Kraken (USD)</option>
+      <option value="binance">Binance (USDT)</option>
+      <option value="coinbase">Coinbase (USD)</option>
+    </select>
     <label>Sort watchlist</label>
     <select id="sortSel">
       <option value="trades">Traded assets first</option>
@@ -196,7 +203,7 @@
       <button class="btn primary" id="saveBtn">Save &amp; reload</button>
     </div>
     <button class="btn" id="reloadBtn" style="width:100%;margin-top:10px">Reload app &middot; clear cache</button>
-    <div class="muted" style="margin-top:10px">Saved on the server (config.json). Data source: Kraken &rarr; Coinbase fallback.</div>
+    <div class="muted" style="margin-top:10px">Applies to the whole watchlist. Auto uses Kraken with Coinbase fallback. Binance uses USDT pairs; availability depends on your connection and the asset.</div>
   </div>
 </div>
 
@@ -314,18 +321,21 @@ function chartMetrics(data,spot){
   var sp=(spot!=null && isFinite(spot) && spot>0) ? +spot : last;
   /* plot range covers spot so a breakout past the window stays on canvas */
   var pLo=Math.min(lo,sp), pHi=Math.max(hi,sp);
-  return {lo:lo,hi:hi,iHi:iHi,iLo:iLo,spot:sp,n:data.length,
+  return {lo:lo,hi:hi,iHi:iHi,iLo:iLo,spot:sp,n:data.length,times:data.map(function(c){return c[0];}),
           plotLo:pLo,plotRange:(pHi-pLo)||1};
 }
 function chartY(m,v,h){ return h-2-((v-m.plotLo)/m.plotRange)*(h-4); }
-function chartX(m,i,w){ var cw=w/m.n; return i*cw+cw/2; }
+function chartX(m,i,w){
+  var cw=w/m.n, span=m.times[m.n-1]-m.times[0];
+  return span>0 ? cw/2+(w-cw)*(m.times[i]-m.times[0])/span : i*cw+cw/2;
+}
 
 /* ---------- market structure (higher highs / lower lows) ---------- */
 
 /* a high or low must move this many typical candle ranges to score a step.
    Measured against candle size rather than window range: a trend inflates
    its own window range, which would raise the bar the stronger it gets. */
-var TREND_DEADBAND_ATR=3.5;
+var TREND_DEADBAND_RANGE=3.5;
 
 function segExtremes(data,from,to){
   var hi=-Infinity,lo=Infinity;
@@ -349,7 +359,7 @@ function trendVerdict(data){
   if(!data||data.length<9) return null;
   var n=data.length, a=Math.floor(n/3), b=Math.floor(2*n/3);
   var s1=segExtremes(data,0,a), s2=segExtremes(data,a,b), s3=segExtremes(data,b,n);
-  var dead=medianCandleRange(data)*TREND_DEADBAND_ATR;
+  var dead=medianCandleRange(data)*TREND_DEADBAND_RANGE;
   var H=stepSign(s1.hi,s2.hi,dead)+stepSign(s2.hi,s3.hi,dead)+stepSign(s1.hi,s3.hi,dead);
   var L=stepSign(s1.lo,s2.lo,dead)+stepSign(s2.lo,s3.lo,dead)+stepSign(s1.lo,s3.lo,dead);
   if(H>0&&L<0) return {label:"Expanding",cls:"flat",why:"higher highs · lower lows"};
@@ -384,19 +394,39 @@ function swingPivots(data,k){
 }
 function pivotK(n){ return Math.max(2,Math.round(n/20)); }
 
+function periodStructure(data,days,now,updated){
+  var interval=(days<=1 ? 15 : days<=7 ? 60 : 240)*60000;
+  var closed=[], reason="", expected=days*86400000/interval;
+  for(var i=0;i<data.length;i++){
+    var c=data[i];
+    if(c.length<5 || !c.every(function(v){return isFinite(v);}) ||
+       c[3]<=0 || c[2]<Math.max(c[1],c[4]) || c[3]>Math.min(c[1],c[4]) ||
+       c[0]%interval!==0 || (i && c[0]-data[i-1][0]!==interval)){
+      reason="invalid or missing candles"; break;
+    }
+    if(c[0]+interval<=now) closed.push(c);
+  }
+  if(!reason && updated && isFinite(updated) && now-updated>900000) reason="stale candles";
+  if(!reason && closed.length<Math.max(9,expected-1)) reason="incomplete history";
+  if(!reason && now-(closed[closed.length-1][0]+interval)>interval+600000) reason="stale candles";
+  if(reason) return {data:[],trend:{label:"Unavailable",cls:"flat",why:reason}};
+  return {data:closed,trend:trendVerdict(closed)};
+}
+
 /* candlestick chart (tokens only) */
-function candleChart(data,w,h,m){
+function candleChart(data,w,h,m,structure){
   var n=m.n, cw=w/n, bw=Math.max(1.2,cw*0.62);
   function Y(v){ return chartY(m,v,h); }
   var s='<svg class="chart" viewBox="0 0 '+w+' '+h+'" height="'+h+'" preserveAspectRatio="none">';
   for(var j=0;j<n;j++){
     var o=data[j][1],high=data[j][2],low=data[j][3],c=data[j][4];
-    var x=j*cw+cw/2, up=c>=o, col=up?"var(--green)":"var(--red)";
+    var x=chartX(m,j,w), up=c>=o, col=up?"var(--green)":"var(--red)";
     s+='<line x1="'+x.toFixed(1)+'" y1="'+Y(high).toFixed(1)+'" x2="'+x.toFixed(1)+'" y2="'+Y(low).toFixed(1)+'" stroke="'+col+'" stroke-width="1"/>';
     var yo=Y(o),yc=Y(c),top=Math.min(yo,yc),bh=Math.max(1,Math.abs(yo-yc));
     s+='<rect x="'+(x-bw/2).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+bh.toFixed(1)+'" fill="'+col+'"/>';
   }
-  var pv=swingPivots(data,pivotK(n)), dr=Math.max(1,cw*0.3);
+  var analyzed=structure || data;
+  var pv=swingPivots(analyzed,pivotK(analyzed.length)), dr=Math.max(1,cw*0.3);
   for(var q=0;q<pv.highs.length;q++) s+=pivotDot(chartX(m,pv.highs[q],w),Y(data[pv.highs[q]][2])-2,dr);
   for(var r=0;r<pv.lows.length;r++)  s+=pivotDot(chartX(m,pv.lows[r],w), Y(data[pv.lows[r]][3])+2,dr);
   s+=channelLine(m,pv.highs,function(i){return data[i][2];},w,h,"var(--muted)");
@@ -476,24 +506,27 @@ function axisTime(ms,days){
 /* keep a label anchored to its candle without letting it run off either edge */
 function labelLeft(m,i,w){ return Math.max(8,Math.min(92,(chartX(m,i,w)/w)*100)); }
 
-function chartWithAxis(data,w,h,days,spot,trendData){
+function chartWithAxis(data,w,h,days,spot,updated){
   if(!data||data.length<2) return '<svg class="chart" height="'+h+'"></svg>';
   var m=chartMetrics(data,spot), labels="";
   var n=m.n; days=days||7;
-  for(var f=0;f<=3;f++){ var idx=Math.round((n-1)*f/3); labels+='<span>'+axisTime(data[idx][0],days)+'</span>'; }
+  for(var f=0;f<=3;f++){
+    var time=data[0][0]+(data[n-1][0]-data[0][0])*f/3;
+    labels+='<span>'+axisTime(time,days)+'</span>';
+  }
   var spotTop=Math.max(0,Math.min(h-11,chartY(m,m.spot,h)-6));
   var hiTop=Math.max(0,chartY(m,m.hi,h)-11);
   var loTop=Math.min(h-11,chartY(m,m.lo,h)+2);
-  /* the chip reads 24h; the drawn pattern stays on the displayed period */
-  var tr=trendVerdict(trendData&&trendData.length>=9 ? trendData : data);
-  var trWin=(trendData&&trendData.length>=9) ? "24h" : days+"d";
+  /* Badge and channel pivots share the selected period's closed candles. */
+  var structure=periodStructure(data,days,Date.now(),updated), tr=structure.trend;
+  var trWin=days===1 ? "24h" : days+"d";
   var trHtml=tr?('<div class="trendrow"><span class="trend '+tr.cls+'">'+tr.label+'</span>'+
                  '<span class="why">'+esc(tr.why)+' &middot; '+trWin+'</span></div>'):"";
   return '<div class="chartwrap">'+
     '<div class="yhi" style="top:'+hiTop.toFixed(0)+'px;left:'+labelLeft(m,m.iHi,w).toFixed(1)+'%">&#9650; '+fmtUsd(m.hi)+'</div>'+
     '<div class="ylo" style="top:'+loTop.toFixed(0)+'px;left:'+labelLeft(m,m.iLo,w).toFixed(1)+'%">&#9660; '+fmtUsd(m.lo)+'</div>'+
     '<div class="ylast" style="top:'+spotTop.toFixed(0)+'px">'+fmtUsd(m.spot)+'</div>'+
-    candleChart(data,w,h,m)+
+    candleChart(data,w,h,m,structure.data)+
     '<div class="xaxis">'+labels+'</div>'+trHtml+
     '</div>';
 }
@@ -638,12 +671,14 @@ function render(s){
   if(!coins.length){ cl='<div class="empty">No assets. Tap &#9881; to add.</div>'; }
   for(var k=0;k<coins.length;k++){
     var c=coins[k];
-    var tag=c.source?('<span class="srctag">'+(c.source==="kraken"?"Kraken":"Coinbase")+'</span>'):"";
+    var sourceName={kraken:"Kraken · USD",coinbase:"Coinbase · USD",binance:"Binance · USDT"};
+    var tag=c.source?('<span class="srctag">'+esc(sourceName[c.source]||c.source)+'</span>'):"";
     cl+='<div class="coin'+(c.active?' active':'')+'"><div class="top">'+
       '<div><span class="sym">'+esc(c.sym)+'</span><span class="name">'+esc(c.name)+'</span></div>'+
-      '<div><span class="val">'+fmtUsd(c.price)+'</span>'+
+      '<div><span class="val">'+(c.price>0?fmtUsd(c.price):"&mdash;")+'</span>'+
         '<span class="chg '+cls(c.chg24h)+'">'+(c.chg24h!=null?fmtPct(c.chg24h)+" 24h":"")+'</span></div></div>'+
-      chartWithAxis(c.candles,320,72,s.candleDays,c.price,c.cand24)+tag+'</div>';
+      chartWithAxis(c.candles,320,72,s.candleDays,c.price,c.candlesUpdated)+tag+
+      (c.marketError?'<div class="muted">Market data unavailable: '+esc(c.marketError)+'</div>':"")+'</div>';
   }
   $("cxList").innerHTML=cl;
 
@@ -662,6 +697,7 @@ function openSettings(){
     draftCfg=c; draftCoins=(c.coins||[]).slice();
     $("walletInput").value=c.wallet||"";
     $("daysSel").value=String(c.candleDays||7);
+    $("providerSel").value=c.marketProvider||"auto";
     $("sortSel").value=c.sort||"trades";
     renderChips(); $("searchInput").value=""; $("results").innerHTML="";
     $("modal").className="modal show";
@@ -707,7 +743,7 @@ function onSearch(){
   },350);
 }
 function saveSettings(){
-  var body={ wallet:$("walletInput").value.trim(), candleDays:+$("daysSel").value||7, sort:$("sortSel").value||"trades", coins:draftCoins||[] };
+  var body={ wallet:$("walletInput").value.trim(), candleDays:+$("daysSel").value||7, marketProvider:$("providerSel").value||"auto", sort:$("sortSel").value||"trades", coins:draftCoins||[] };
   api("/api/config",{method:"POST",json:true,body:JSON.stringify(body)}, function(res){
     if(!res||res.status===401){ showPin(""); return; }
     if(!res.ok){ showErr("Save failed"); return; }

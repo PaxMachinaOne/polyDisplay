@@ -3,6 +3,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -518,13 +520,14 @@ func TestMarketPairsPreserveLegacyOverride(t *testing.T) {
 }
 
 func TestFetchMarketCandlesFallsBackToCoinbase(t *testing.T) {
+	base := time.Now().UTC().Truncate(15 * time.Minute).Add(-2 * time.Hour).Unix()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/0/public/OHLC":
 			w.WriteHeader(http.StatusUnavailableForLegalReasons)
 		case r.URL.Path == "/products/BTC-USD/candles":
 			// Coinbase is newest-first: [time, low, high, open, close, volume].
-			w.Write([]byte(`[[200,2,4,3,3.5,10],[100,1,3,2,2.5,8]]`))
+			fmt.Fprintf(w, `[[%d,2,4,3,3.5,10],[%d,1,3,2,2.5,8]]`, base+900, base)
 		default:
 			http.NotFound(w, r)
 		}
@@ -541,7 +544,7 @@ func TestFetchMarketCandlesFallsBackToCoinbase(t *testing.T) {
 	if source != "coinbase" {
 		t.Errorf("source = %q, want coinbase", source)
 	}
-	if len(got) != 2 || got[0] != (Candle{100000, 2, 3, 1, 2.5}) || got[1][0] != 200000 {
+	if len(got) != 2 || got[0] != (Candle{float64(base) * 1000, 2, 3, 1, 2.5}) || got[1][0] != float64(base+900)*1000 {
 		t.Errorf("normalized Coinbase candles = %#v", got)
 	}
 }
@@ -1106,5 +1109,211 @@ func TestBuildPnlUsesSeriesEnd(t *testing.T) {
 	}
 	if buildPnl(nil) != nil {
 		t.Error("buildPnl must return nil without a series")
+	}
+}
+
+func TestCoinbasePagesAndMatchesKrakenIntervals(t *testing.T) {
+	for _, days := range []int{1, 7, 14, 30} {
+		t.Run(fmt.Sprint(days), func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				from, err := time.Parse(time.RFC3339, r.URL.Query().Get("start"))
+				if err != nil {
+					t.Error(err)
+				}
+				to, err := time.Parse(time.RFC3339, r.URL.Query().Get("end"))
+				if err != nil {
+					t.Error(err)
+				}
+				gran, _ := candleParams(days, "coinbase")
+				if to.Sub(from) > 299*time.Duration(gran)*time.Second {
+					t.Error("page exceeds inclusive candle cap")
+				}
+				var rows [][]float64
+				for ts := from.Unix(); ts <= to.Unix(); ts += int64(gran) {
+					rows = append(rows, []float64{float64(ts), 1, 4, 2, 3, 10})
+				}
+				json.NewEncoder(w).Encode(rows)
+			}))
+			defer srv.Close()
+			orig := coinbaseBase
+			coinbaseBase = srv.URL
+			defer func() { coinbaseBase = orig }()
+			got, err := fetchCoinbaseCandles(Coin{Sym: "BTC"}, days)
+			if err != nil {
+				t.Fatal(err)
+			}
+			interval, limit := candleParams(days, "kraken")
+			if len(got) != limit {
+				t.Fatalf("got %d candles, want %d", len(got), limit)
+			}
+			for i, c := range got {
+				if int64(c[0])%int64(interval*60000) != 0 {
+					t.Error("unaligned bucket")
+				}
+				if i > 0 && c[0]-got[i-1][0] != float64(interval*60000) {
+					t.Error("gap or duplicate across pages")
+				}
+				if c[1] != 2 || c[2] != 4 || c[3] != 1 || c[4] != 3 {
+					t.Errorf("OHLC changed: %v", c)
+				}
+			}
+			wantCalls := 1
+			if days == 14 {
+				wantCalls = 2
+			}
+			if days == 30 {
+				wantCalls = 3
+			}
+			if calls != wantCalls {
+				t.Errorf("calls=%d want %d", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestAggregateCandlesPreservesOHLCAndRejectsMissingHour(t *testing.T) {
+	in := []Candle{{10800000, 13, 16, 12, 15}, {0, 10, 12, 9, 11}, {3600000, 11, 14, 10, 13}, {7200000, 13, 15, 11, 13},
+		{3600000, 11, 14, 10, 13}, // overlapping page
+		{14400000, 15, 18, 14, 17}, {21600000, 17, 20, 16, 19}, {25200000, 19, 21, 18, 20}}
+	got := aggregateCandles(in, 3600, 14400, time.Unix(28800, 0))
+	if len(got) != 1 || got[0] != (Candle{0, 10, 16, 9, 15}) {
+		t.Fatalf("aggregate=%v", got)
+	}
+	// Keep an unfinished bucket for drawing; the frontend excludes it from analysis.
+	got = aggregateCandles([]Candle{{28800000, 20, 22, 19, 21}}, 3600, 14400, time.Unix(30000, 0))
+	if len(got) != 1 {
+		t.Fatal("current bucket lost")
+	}
+}
+
+func TestSelectedProvidersDoNotFallBack(t *testing.T) {
+	for _, provider := range []string{"kraken", "coinbase", "binance"} {
+		t.Run(provider, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				expected := map[string]string{"kraken": "/0/public/OHLC", "coinbase": "/products/BTC-USD/candles", "binance": "/api/v3/klines"}[provider]
+				if r.URL.Path != expected {
+					t.Errorf("unexpected fallback: %s", r.URL.Path)
+				}
+				w.WriteHeader(http.StatusUnavailableForLegalReasons)
+			}))
+			defer srv.Close()
+			k, c, b := krakenBase, coinbaseBase, binanceBase
+			krakenBase, coinbaseBase, binanceBase = srv.URL, srv.URL, srv.URL
+			defer func() { krakenBase, coinbaseBase, binanceBase = k, c, b }()
+			_, source, err := fetchSelectedCandles(Coin{Sym: "BTC"}, 30, provider)
+			if err == nil || source != provider || calls != 1 {
+				t.Fatalf("source=%s error=%v calls=%d", source, err, calls)
+			}
+		})
+	}
+}
+
+func TestBinanceCandleIntervalsAndNormalization(t *testing.T) {
+	for _, days := range []int{1, 7, 14, 30} {
+		t.Run(fmt.Sprint(days), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				expected := map[int]string{1: "15m", 7: "1h", 14: "4h", 30: "4h"}[days]
+				_, limit := candleParams(days, "kraken")
+				if r.URL.Query().Get("symbol") != "BTCUSDT" || r.URL.Query().Get("interval") != expected || r.URL.Query().Get("limit") != fmt.Sprint(limit) {
+					t.Errorf("query=%s", r.URL.RawQuery)
+				}
+				w.Write([]byte(`[[2000,"3","4","2","3.5"],[1000,"2","3","1","2.5"]]`))
+			}))
+			defer srv.Close()
+			orig := binanceBase
+			binanceBase = srv.URL
+			defer func() { binanceBase = orig }()
+			got, source, err := fetchSelectedCandles(Coin{Sym: "BTC"}, days, "binance")
+			if err != nil || source != "binance" || len(got) != 2 || got[0] != (Candle{1000, 2, 3, 1, 2.5}) {
+				t.Fatalf("%s %v %v", source, got, err)
+			}
+		})
+	}
+}
+
+func TestRefreshFastHonorsSelectedPriceProvider(t *testing.T) {
+	for _, provider := range []string{"kraken", "coinbase", "binance"} {
+		t.Run(provider, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				expected := map[string]string{"kraken": "/0/public/Ticker", "coinbase": "/products/BTC-USD/ticker", "binance": "/api/v3/ticker/price"}[provider]
+				if r.URL.Path != expected {
+					t.Errorf("wrong provider: %s", r.URL.Path)
+				}
+				if provider == "kraken" {
+					w.Write([]byte(`{"error":[],"result":{"BTC/USD":{"c":["123"]}}}`))
+				} else {
+					w.Write([]byte(`{"price":"123"}`))
+				}
+			}))
+			defer srv.Close()
+			k, c, b := krakenBase, coinbaseBase, binanceBase
+			origCfg, origState, origPrices := cfg, state, marketPrice
+			krakenBase, coinbaseBase, binanceBase = srv.URL, srv.URL, srv.URL
+			cfg = Config{MarketProvider: provider, CandleDays: 1, Coins: []Coin{{Sym: "BTC", ID: "bitcoin"}}}
+			marketPrice = map[string]float64{}
+			defer func() {
+				krakenBase, coinbaseBase, binanceBase = k, c, b
+				cfg, state, marketPrice = origCfg, origState, origPrices
+			}()
+			refreshFast()
+			if len(state.Coins) != 1 || state.Coins[0].Price != 123 {
+				t.Fatalf("state=%v", state.Coins)
+			}
+		})
+	}
+}
+
+func TestProviderConfigValidatesPersistsAndClearsCache(t *testing.T) {
+	t.Chdir(t.TempDir())
+	origCfg, origState, rev := cfg, state, configRevision
+	origCandles, orig24, origSource, origPrices, origErrors, origUpdated := candles, cand24, csource, marketPrice, candleErrors, candleUpdated
+	defer func() {
+		cfg, state, configRevision = origCfg, origState, rev
+		candles, cand24, csource, marketPrice, candleErrors, candleUpdated = origCandles, orig24, origSource, origPrices, origErrors, origUpdated
+	}()
+	cfg = defaultConfig()
+	for _, body := range []string{`{"marketProvider":"invalid"}`, `{"candleDays":2}`} {
+		w := httptest.NewRecorder()
+		handleConfig(w, httptest.NewRequest("POST", "/api/config", strings.NewReader(body)))
+		if w.Code != 400 || configRevision != rev {
+			t.Fatalf("invalid config changed state: %d", w.Code)
+		}
+	}
+	for _, provider := range []string{"kraken", "binance", "coinbase", "auto"} {
+		state.Coins = []CoinState{{Sym: "BTC"}}
+		candles = map[string][]Candle{"bitcoin": {{0, 1, 2, 1, 1}}}
+		w := httptest.NewRecorder()
+		handleConfig(w, httptest.NewRequest("POST", "/api/config", strings.NewReader(fmt.Sprintf(`{"marketProvider":%q,"candleDays":30}`, provider))))
+		if w.Code != 200 || cfg.MarketProvider != provider || len(candles) != 0 || len(state.Coins) != 0 {
+			t.Fatalf("provider switch failed: %d %v", w.Code, cfg)
+		}
+		saved := loadConfig()
+		if saved.MarketProvider != provider || saved.CandleDays != 30 {
+			t.Errorf("persisted=%v", saved)
+		}
+	}
+}
+
+func TestRefreshSlowDiscardsResultsAfterProviderChange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cfg.MarketProvider = "coinbase"
+		configRevision++
+		mu.Unlock()
+		w.Write([]byte(`{"error":[],"result":{"BTC/USD":[[100,"2","3","1","2.5"]],"last":100}}`))
+	}))
+	defer srv.Close()
+	origK, origCfg, rev, origCandles := krakenBase, cfg, configRevision, candles
+	krakenBase = srv.URL
+	cfg = Config{MarketProvider: "kraken", CandleDays: 1, Coins: []Coin{{Sym: "BTC", ID: "bitcoin"}}}
+	candles = map[string][]Candle{}
+	defer func() { krakenBase, cfg, configRevision, candles = origK, origCfg, rev, origCandles }()
+	refreshSlow()
+	if len(candles) != 0 {
+		t.Fatal("previous provider results repopulated cleared cache")
 	}
 }

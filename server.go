@@ -45,11 +45,12 @@ type Coin struct {
 }
 
 type Config struct {
-	Wallet     string `json:"wallet"`
-	CandleDays int    `json:"candleDays"`
-	Port       int    `json:"port"`
-	Sort       string `json:"sort"` // "az" (symbol A-Z) | "config" (as added)
-	Coins      []Coin `json:"coins"`
+	MarketProvider string `json:"marketProvider"`
+	Wallet         string `json:"wallet"`
+	CandleDays     int    `json:"candleDays"`
+	Port           int    `json:"port"`
+	Sort           string `json:"sort"` // "az" (symbol A-Z) | "config" (as added)
+	Coins          []Coin `json:"coins"`
 }
 
 const configPath = "config.json"
@@ -57,9 +58,10 @@ const envPath = ".env"
 
 func defaultConfig() Config {
 	return Config{
-		Wallet:     "",
-		CandleDays: 1,
-		Sort:       "trades",
+		MarketProvider: "auto",
+		Wallet:         "",
+		CandleDays:     1,
+		Sort:           "trades",
 	}
 }
 
@@ -150,6 +152,9 @@ func loadConfig() Config {
 		c = defaultConfig()
 	}
 	c.Port = listenPort(c.Port)
+	if !validMarketProvider(c.MarketProvider) {
+		c.MarketProvider = "auto"
+	}
 	if c.CandleDays == 0 {
 		c.CandleDays = 7
 	}
@@ -213,15 +218,17 @@ func saveConfig(c Config) {
 type Candle [5]float64 // [openTimeMs, open, high, low, close]
 
 type CoinState struct {
-	Sym     string   `json:"sym"`
-	Name    string   `json:"name"`
-	ID      string   `json:"id"`
-	Price   float64  `json:"price"`
-	Chg24h  float64  `json:"chg24h"`
-	Source  string   `json:"source"` // "kraken" | "coinbase" | ""
-	Active  bool     `json:"active"` // referenced by a current Polymarket position
-	Candles []Candle `json:"candles"`
-	Cand24  []Candle `json:"cand24"` // last 24h, whatever the display period
+	CandlesUpdated int64    `json:"candlesUpdated"`
+	MarketError    string   `json:"marketError,omitempty"`
+	Sym            string   `json:"sym"`
+	Name           string   `json:"name"`
+	ID             string   `json:"id"`
+	Price          float64  `json:"price"`
+	Chg24h         float64  `json:"chg24h"`
+	Source         string   `json:"source"` // "kraken" | "coinbase" | "binance" | ""
+	Active         bool     `json:"active"` // referenced by a current Polymarket position
+	Candles        []Candle `json:"candles"`
+	Cand24         []Candle `json:"cand24"` // last 24h, whatever the display period
 }
 
 type Position struct {
@@ -277,14 +284,17 @@ type State struct {
 }
 
 var (
-	mu          sync.RWMutex
-	cfg         Config
-	state       State
-	candles     = map[string][]Candle{} // id -> candles (refreshed slowly)
-	cand24      = map[string][]Candle{} // id -> last 24h, for the trend read
-	csource     = map[string]string{}   // id -> candle source
-	marketPrice = map[string]float64{}  // id -> last good spot price
-	slowMu      sync.Mutex
+	mu             sync.RWMutex
+	configRevision uint64
+	cfg            Config
+	state          State
+	candles        = map[string][]Candle{} // id -> candles (refreshed slowly)
+	cand24         = map[string][]Candle{} // id -> last 24h, for daily price change
+	candleErrors   = map[string]string{}
+	candleUpdated  = map[string]int64{}
+	csource        = map[string]string{}  // id -> candle source
+	marketPrice    = map[string]float64{} // id -> last good spot price
+	slowMu         sync.Mutex
 	// Fresh connection per request: a VPN's short idle timeout was dropping the
 	// pooled keep-alive connections during the 20s gap between cycles, so the
 	// first couple of requests each cycle failed (BTC/ETH showed price 0).
@@ -478,7 +488,79 @@ func cgHeaders() map[string]string {
 var (
 	krakenBase   = "https://api.kraken.com"
 	coinbaseBase = "https://api.exchange.coinbase.com"
+	binanceBase  = "https://api.binance.com"
 )
+
+func validMarketProvider(provider string) bool {
+	return provider == "auto" || provider == "kraken" || provider == "coinbase" || provider == "binance"
+}
+
+func binanceSymbol(c Coin) string { return marketSymbol(c) + "USDT" }
+
+func fetchBinanceCandles(c Coin, days int) ([]Candle, error) {
+	interval, limit := candleParams(days, "kraken")
+	intervalName := "15m"
+	if interval == 60 {
+		intervalName = "1h"
+	}
+	if interval == 240 {
+		intervalName = "4h"
+	}
+	q := url.Values{"symbol": {binanceSymbol(c)}, "interval": {intervalName}, "limit": {strconv.Itoa(limit)}}
+	var rows [][]interface{}
+	if err := getJSON(binanceBase+"/api/v3/klines?"+q.Encode(), &rows, nil); err != nil {
+		return nil, err
+	}
+	var out []Candle
+	for _, row := range rows {
+		if len(row) < 5 {
+			return nil, fmt.Errorf("invalid Binance candle")
+		}
+		var candle Candle
+		for i := 0; i < 5; i++ {
+			v, err := strconv.ParseFloat(fmt.Sprint(row[i]), 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid Binance candle: %w", err)
+			}
+			candle[i] = v
+		}
+		out = append(out, candle)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty")
+	}
+	return trimCandles(out, limit), nil
+}
+
+func fetchSelectedCandles(c Coin, days int, provider string) ([]Candle, string, error) {
+	var candles []Candle
+	var err error
+	switch provider {
+	case "kraken":
+		candles, err = fetchKrakenCandles(c, days)
+	case "coinbase":
+		candles, err = fetchCoinbaseCandles(c, days)
+	case "binance":
+		candles, err = fetchBinanceCandles(c, days)
+	default:
+		return fetchMarketCandles(c, days)
+	}
+	return candles, provider, err
+}
+
+func fetchBinancePrice(c Coin) (float64, error) {
+	var raw struct {
+		Price string `json:"price"`
+	}
+	if err := getJSON(binanceBase+"/api/v3/ticker/price?symbol="+url.QueryEscape(binanceSymbol(c)), &raw, nil); err != nil {
+		return 0, err
+	}
+	p, err := strconv.ParseFloat(raw.Price, 64)
+	if err != nil || p <= 0 {
+		return 0, fmt.Errorf("no price")
+	}
+	return p, nil
+}
 
 func marketSymbol(c Coin) string {
 	s := strings.ToUpper(strings.TrimSpace(c.Sym))
@@ -506,9 +588,9 @@ func candleParams(days int, provider string) (interval, limit int) {
 	if provider == "kraken" {
 		switch {
 		case days <= 1:
-			return 30, 48
+			return 15, 96
 		case days <= 7:
-			return 240, 42
+			return 60, 168
 		case days <= 14:
 			return 240, 84
 		default:
@@ -521,9 +603,9 @@ func candleParams(days int, provider string) (interval, limit int) {
 	case days <= 7:
 		return 3600, 168
 	case days <= 14:
-		return 21600, 56
+		return 3600, 336
 	default:
-		return 21600, 120
+		return 3600, 720
 	}
 }
 
@@ -578,27 +660,81 @@ func fetchKrakenCandles(c Coin, days int) ([]Candle, error) {
 }
 
 func fetchCoinbaseCandles(c Coin, days int) ([]Candle, error) {
-	granularity, limit := candleParams(days, "coinbase")
+	granularity, _ := candleParams(days, "coinbase")
+	interval, limit := candleParams(days, "kraken")
+	bucketSeconds := int64(interval * 60)
 	end := time.Now().UTC()
-	q := url.Values{}
-	q.Set("granularity", strconv.Itoa(granularity))
-	q.Set("start", end.Add(-time.Duration(days)*24*time.Hour).Format(time.RFC3339))
-	q.Set("end", end.Format(time.RFC3339))
-	u := coinbaseBase + "/products/" + url.PathEscape(coinbaseProduct(c)) + "/candles?" + q.Encode()
-	var raw [][]float64
-	if err := getJSON(u, &raw, nil); err != nil {
-		return nil, err
-	}
-	out := make([]Candle, 0, len(raw))
-	for _, k := range raw {
-		if len(k) >= 5 {
-			out = append(out, Candle{k[0] * 1000, k[3], k[2], k[1], k[4]})
+	start := time.Unix(end.Unix()/bucketSeconds*bucketSeconds-int64(days)*86400, 0).UTC()
+	var out []Candle
+	for from := start; from.Before(end); {
+		// Leave room for an inclusive endpoint within Coinbase's 300-candle cap.
+		to := from.Add(time.Duration(299*granularity) * time.Second)
+		if to.After(end) {
+			to = end
+		}
+		q := url.Values{}
+		q.Set("granularity", strconv.Itoa(granularity))
+		q.Set("start", from.Format(time.RFC3339))
+		q.Set("end", to.Format(time.RFC3339))
+		u := coinbaseBase + "/products/" + url.PathEscape(coinbaseProduct(c)) + "/candles?" + q.Encode()
+		var raw [][]float64
+		if err := getJSON(u, &raw, nil); err != nil {
+			return nil, err
+		}
+		for _, k := range raw {
+			if len(k) >= 5 && k[0] >= float64(start.Unix()) && k[0] <= float64(end.Unix()) {
+				out = append(out, Candle{k[0] * 1000, k[3], k[2], k[1], k[4]})
+			}
+		}
+		from = to
+		if from.Before(end) {
+			time.Sleep(1100 * time.Millisecond)
 		}
 	}
+	out = aggregateCandles(out, granularity, interval*60, end)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("empty")
 	}
 	return trimCandles(out, limit), nil
+}
+
+// Rebucket Coinbase into the same UTC-aligned intervals used by Kraken.
+// Deduplicate overlapping pages and reject incomplete historical buckets.
+func aggregateCandles(in []Candle, sourceSeconds, targetSeconds int, now time.Time) []Candle {
+	trimCandles(in, len(in))
+	var out []Candle
+	var bucket Candle
+	count := 0
+	previous := float64(-1)
+	flush := func() {
+		if count == targetSeconds/sourceSeconds || (count > 0 && bucket[0]+float64(targetSeconds)*1000 > float64(now.UnixMilli())) {
+			out = append(out, bucket)
+		}
+	}
+	for _, c := range in {
+		if c[0] == previous {
+			continue
+		}
+		previous = c[0]
+		t := float64(int64(c[0])/int64(targetSeconds*1000)) * float64(targetSeconds*1000)
+		if count == 0 || t != bucket[0] {
+			flush()
+			bucket = c
+			bucket[0] = t
+			count = 1
+		} else {
+			if c[2] > bucket[2] {
+				bucket[2] = c[2]
+			}
+			if c[3] < bucket[3] {
+				bucket[3] = c[3]
+			}
+			bucket[4] = c[4]
+			count++
+		}
+	}
+	flush()
+	return out
 }
 
 func fetchMarketCandles(c Coin, days int) ([]Candle, string, error) {
@@ -925,6 +1061,7 @@ func refreshPnl(wallet string, now time.Time) {
 func refreshFast() {
 	mu.RLock()
 	c := cfg
+	revision := configRevision
 	mu.RUnlock()
 	now := time.Now()
 
@@ -992,33 +1129,49 @@ func refreshFast() {
 		refreshPnl(wallet, time.Now())
 	}
 
-	// Kraken returns all requested tickers in one call. Only missing pairs fall
-	// back to Coinbase, and the last good price survives a provider outage.
-	prices, _ := fetchKrakenPrices(c.Coins)
+	// Explicit selection never silently mixes providers. Auto retains fallback.
+	prices := map[string]float64{}
+	if c.MarketProvider == "" || c.MarketProvider == "auto" || c.MarketProvider == "kraken" {
+		prices, _ = fetchKrakenPrices(c.Coins)
+	}
 	if prices == nil {
 		prices = map[string]float64{}
 	}
 	var priceMu sync.Mutex
 	var priceWG sync.WaitGroup
+	var missing []Coin
 	for _, cn := range c.Coins {
-		if prices[cn.ID] == 0 {
-			cn := cn
-			priceWG.Add(1)
-			go func() {
-				defer priceWG.Done()
-				if p, err := fetchCoinbasePrice(cn); err == nil {
-					priceMu.Lock()
-					prices[cn.ID] = p
-					priceMu.Unlock()
-				}
-			}()
+		if prices[cn.ID] == 0 && c.MarketProvider != "kraken" {
+			missing = append(missing, cn)
 		}
+	}
+	for _, cn := range missing {
+		priceWG.Add(1)
+		go func() {
+			defer priceWG.Done()
+			var p float64
+			var err error
+			if c.MarketProvider == "binance" {
+				p, err = fetchBinancePrice(cn)
+			} else {
+				p, err = fetchCoinbasePrice(cn)
+			}
+			if err == nil {
+				priceMu.Lock()
+				prices[cn.ID] = p
+				priceMu.Unlock()
+			}
+		}()
 	}
 	priceWG.Wait()
 
 	active := activeCoins(positions, c.Coins)
 
 	mu.Lock()
+	if revision != configRevision {
+		mu.Unlock()
+		return
+	}
 	for id, price := range prices {
 		marketPrice[id] = price
 	}
@@ -1028,7 +1181,7 @@ func refreshFast() {
 		coinStates = append(coinStates, CoinState{
 			Sym: cn.Sym, Name: cn.Name, ID: cn.ID,
 			Price: p, Chg24h: candleChange24(p, cand24[cn.ID]),
-			Source: csource[cn.ID], Active: active[cn.ID], Candles: candles[cn.ID],
+			CandlesUpdated: candleUpdated[cn.ID], MarketError: candleErrors[cn.ID], Source: csource[cn.ID], Active: active[cn.ID], Candles: candles[cn.ID],
 			Cand24: cand24[cn.ID],
 		})
 	}
@@ -1053,28 +1206,39 @@ func refreshSlow() {
 
 	mu.RLock()
 	c := cfg
+	revision := configRevision
 	mu.RUnlock()
 
 	for _, cn := range c.Coins {
-		cs, src, err := fetchMarketCandles(cn, c.CandleDays)
+		cs, src, err := fetchSelectedCandles(cn, c.CandleDays, c.MarketProvider)
 		if err != nil {
 			log.Printf("market candles %s: %v", cn.Sym, err)
 		}
-		// the trend read always wants 24h; a 7d/4h window only spans 6 candles
+		// Keep a separate 24h series only for the daily price change.
 		var c24 []Candle
 		if cs != nil && c.CandleDays == 1 {
 			c24 = cs
 		} else {
 			time.Sleep(1100 * time.Millisecond)
-			if trend, _, trendErr := fetchMarketCandles(cn, 1); trendErr == nil {
+			if trend, _, trendErr := fetchSelectedCandles(cn, 1, c.MarketProvider); trendErr == nil {
 				c24 = trend
 			} else {
 				log.Printf("market trend %s: %v", cn.Sym, trendErr)
 			}
 		}
 		mu.Lock()
+		if revision != configRevision {
+			mu.Unlock()
+			return
+		}
+		if err != nil {
+			candleErrors[cn.ID] = err.Error()
+		} else {
+			delete(candleErrors, cn.ID)
+		}
 		if cs != nil {
 			candles[cn.ID] = cs
+			candleUpdated[cn.ID] = time.Now().UnixMilli()
 			csource[cn.ID] = src
 		}
 		if c24 != nil {
@@ -1120,7 +1284,20 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad json", 400)
 			return
 		}
+
+		if nc.MarketProvider != "" && !validMarketProvider(nc.MarketProvider) {
+			http.Error(w, "unsupported market provider", http.StatusBadRequest)
+			return
+		}
+		if nc.CandleDays != 0 && nc.CandleDays != 1 && nc.CandleDays != 7 && nc.CandleDays != 14 && nc.CandleDays != 30 {
+			http.Error(w, "unsupported candle period", http.StatusBadRequest)
+			return
+		}
 		mu.Lock()
+		configRevision++
+		if nc.MarketProvider != "" {
+			cfg.MarketProvider = nc.MarketProvider
+		}
 		if nc.Wallet != "" {
 			cfg.Wallet = strings.TrimSpace(nc.Wallet)
 		}
@@ -1134,9 +1311,13 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			cfg.Coins = nc.Coins
 		}
 		saved := cfg
+		state.Coins = nil
+		state.CandleDays = cfg.CandleDays
 		candles = map[string][]Candle{}
 		cand24 = map[string][]Candle{}
 		csource = map[string]string{}
+		candleErrors = map[string]string{}
+		candleUpdated = map[string]int64{}
 		marketPrice = map[string]float64{}
 		mu.Unlock()
 		saveConfig(saved)
